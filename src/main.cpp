@@ -226,11 +226,13 @@ void setup() {
       uint32_t bn = prefs.getUInt("n", 0);
       ++bn;
       prefs.putUInt("n", bn);
+      size_t nvs_free = prefs.freeEntries();   // NVS partition headroom; near 0 = full (the boot-loop trigger)
       prefs.end();
       meshcomod_touch_set_boot_stats(bn, static_cast<uint8_t>(esp_reset_reason()));
-      Serial.printf("[BOOT] touch_boot_n=%lu reason=%u\n",
+      Serial.printf("[BOOT] touch_boot_n=%lu reason=%u nvs_free_entries=%u\n",
                     static_cast<unsigned long>(bn),
-                    static_cast<unsigned>(esp_reset_reason()));
+                    static_cast<unsigned>(esp_reset_reason()),
+                    static_cast<unsigned>(nvs_free));
     }
     the_mesh.initTxtTxUniquenessFromRng();
   }
