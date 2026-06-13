@@ -6,17 +6,218 @@
 
 #include "SdNvsPrefs.h"   // NVS, or SD /meshcomod fallback when NVS is unusable (Launcher)
 
+#include <stddef.h>   // offsetof
+#include <string.h>   // memcpy
+
 static const char* TOUCH_NS = "touch";
-static const char* KEY_SCR_TO = "scr_to_s";
-static const char* KEY_DC_SHOW = "dc_show";
-static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
-static const bool DEFAULT_DC_SHOW = true;
 
 static SdNvsPrefs s_prefs;
 static bool s_begun = false;
 
+// ---------------------------------------------------------------------------
+// Packed scalar config blob ("cfg")
+// ---------------------------------------------------------------------------
+//
+// NVS is a tiny (~20 KB) partition shared across firmwares; every distinct key
+// costs an entry and the namespace was filling up. The many per-key SCALAR
+// settings (brightness, kb backlight, accent colour, language, …) are therefore
+// packed into ONE versioned blob keyed "cfg". Strings (tile_srv, rgn_scope,
+// lk_wall, channel-scopes, quick-replies), the byte blobs (fav / ign / rpw) and
+// the Wi-Fi slots keep their own keys — and "use_sd" / "setup_ok" stay standalone
+// keys too, because main.cpp reads (and for use_sd, writes) them directly via a
+// raw Preferences open at boot, BEFORE the touch prefs load.
+//
+// On first run with the blob absent we read every legacy per-key into s_cfg, write
+// "cfg" ONCE, and only after that durable write do we remove() the legacy keys to
+// reclaim their entries. The write-before-remove ordering makes the migration
+// crash-safe and idempotent (a power-cut before the write just re-migrates next
+// boot; one after it finds "cfg" present and skips). `magic` rejects a garbage /
+// short read (→ treat as absent → defaults); `ver` lets later builds add fields.
+static const char* KEY_CFG = "cfg";
+static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
+static const uint8_t  TOUCH_CFG_VER   = 1;
+
+// Defaults (kept identical to the historical per-key defaults).
+static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
+static const uint8_t  DEFAULT_BRIGHTNESS       = 100;
+static const uint8_t  DEFAULT_KB_BL            = 2;          // auto
+static const uint8_t  DEFAULT_KB_LAYOUT        = 0;          // English
+static const uint8_t  DEFAULT_KB_SECONDARY     = 0;          // None
+static const uint32_t DEFAULT_LOCK_COLOR       = 0xE6F2FFu;  // soft white
+static const uint32_t DEFAULT_ACCENT           = 0x15B6A6u;  // brand teal
+static const bool     DEFAULT_DC_SHOW          = true;
+
+struct __attribute__((packed)) TouchCfg {
+  uint16_t magic;            // TOUCH_CFG_MAGIC — rejects a garbage/short read
+  uint8_t  ver;              // TOUCH_CFG_VER   — schema version
+  uint8_t  bright;           // "bright"     1..100 (clamped 5..100 on get/set)
+  uint8_t  kb_bl;            // "kb_bl"      0..2
+  uint8_t  kb_layout;        // "kblang"
+  uint8_t  kb_secondary;     // "kbsec"
+  uint8_t  ui_lang;          // "ui_lang"
+  uint8_t  ui_rotation;      // "uirot"      0..3
+  uint8_t  dc_show;          // "dc_show"    bool
+  uint8_t  use_miles;        // "use_miles"  bool
+  uint8_t  tiles_from_sd;    // "tiles_sd"   bool
+  uint8_t  clr_bubbles;      // "clr_bub"    bool
+  uint8_t  kb_accent;        // "kb_accent"  bool
+  int8_t   time_offs;        // "time_offs"  -23..23
+  uint16_t scr_to_s;         // "scr_to_s"
+  uint16_t kb_enabled;       // "kbenab"     bitmask
+  uint16_t batt_full_mv;     // "battfull"
+  uint32_t lock_color;       // "lk_col"     0xRRGGBB
+  uint32_t accent;           // "accent"     0xRRGGBB
+  uint32_t gps_baud;         // "gps_baud"   0 = unset -> caller fallback
+};
+
+static TouchCfg s_cfg;
+static bool     s_cfg_loaded = false;
+
+// Legacy per-key names — only referenced by the one-time migration below.
+static const char* LK_SCR_TO       = "scr_to_s";
+static const char* LK_DC_SHOW      = "dc_show";
+static const char* LK_BRIGHTNESS   = "bright";
+static const char* LK_KB_BL        = "kb_bl";
+static const char* LK_KB_LAYOUT    = "kblang";
+static const char* LK_KB_SECONDARY = "kbsec";
+static const char* LK_KB_ENABLED   = "kbenab";
+static const char* LK_LOCK_COLOR   = "lk_col";
+static const char* LK_CLR_BUBBLES  = "clr_bub";
+static const char* LK_KB_ACCENT    = "kb_accent";
+static const char* LK_ACCENT       = "accent";
+static const char* LK_TIME_OFFS    = "time_offs";
+static const char* LK_USE_MILES    = "use_miles";
+static const char* LK_TILES_FROM_SD= "tiles_sd";
+static const char* LK_UI_LANG      = "ui_lang";
+static const char* LK_UI_ROTATION  = "uirot";
+static const char* LK_BATT_FULL    = "battfull";
+static const char* LK_GPS_BAUD     = "gps_baud";
+
+static void cfgSetDefaults(TouchCfg& c) {
+  c.magic         = TOUCH_CFG_MAGIC;
+  c.ver           = TOUCH_CFG_VER;
+  c.bright        = DEFAULT_BRIGHTNESS;
+  c.kb_bl         = DEFAULT_KB_BL;
+  c.kb_layout     = DEFAULT_KB_LAYOUT;
+  c.kb_secondary  = DEFAULT_KB_SECONDARY;
+  c.ui_lang       = 0;
+  c.ui_rotation   = 0;
+  c.dc_show       = DEFAULT_DC_SHOW ? 1 : 0;
+  c.use_miles     = 0;
+  c.tiles_from_sd = 0;
+  c.clr_bubbles   = 1;          // default ON
+  c.kb_accent     = 1;          // default ON
+  c.time_offs     = 0;
+  c.scr_to_s      = DEFAULT_SCREEN_TIMEOUT_S;
+  c.kb_enabled    = 0;
+  c.batt_full_mv  = 0;
+  c.lock_color    = DEFAULT_LOCK_COLOR;
+  c.accent        = DEFAULT_ACCENT;
+  c.gps_baud      = 0;          // 0 sentinel -> getter returns caller fallback
+}
+
+// Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
+// discipline every setter in this file uses. Returns true on a durable write.
+static bool cfgFlush() {
+  s_prefs.end();
+  if (!s_prefs.begin(TOUCH_NS, false)) { s_begun = false; return false; }
+  bool ok = s_prefs.putBytes(KEY_CFG, &s_cfg, sizeof(s_cfg)) == sizeof(s_cfg);
+  s_prefs.end();
+  s_begun = s_prefs.begin(TOUCH_NS, true);
+  return ok;
+}
+
+// Load "cfg" once; on absence run the one-time legacy migration. Must be called
+// with the namespace already open (RO is fine for the load + legacy reads; the
+// migration write reopens RW via cfgFlush). Idempotent: a no-op after the first
+// successful run because "cfg" then exists.
+static void cfgLoadOrMigrate() {
+  if (s_cfg_loaded) return;
+  cfgSetDefaults(s_cfg);
+
+  // isKey() does NOT emit the [E] NOT_FOUND log that getBytes() would on a miss,
+  // so probe first to keep the (USB-CDC) console clean on a fresh device.
+  if (s_prefs.isKey(KEY_CFG)) {
+    TouchCfg tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    size_t n = s_prefs.getBytes(KEY_CFG, &tmp, sizeof(tmp));
+    // Need at least magic(2)+ver(1) to trust the header; reject anything shorter
+    // (a half-written / garbage blob) and re-derive from legacy keys / defaults.
+    if (n >= offsetof(TouchCfg, bright) && tmp.magic == TOUCH_CFG_MAGIC) {
+      // Copy whatever was stored over the defaults (a shorter, older blob leaves
+      // newer trailing fields at their default), then version-upgrade if needed.
+      memcpy(&s_cfg, &tmp, n < sizeof(s_cfg) ? n : sizeof(s_cfg));
+      if (s_cfg.ver < TOUCH_CFG_VER) {
+        s_cfg.ver = TOUCH_CFG_VER;
+        s_cfg.magic = TOUCH_CFG_MAGIC;
+        cfgFlush();                // rewrite with new fields defaulted-in
+      }
+      s_cfg_loaded = true;
+      return;
+    }
+    // Garbage / short / wrong-magic read -> fall through and re-derive from
+    // legacy keys (or defaults), overwriting the bad blob.
+  }
+
+  // No (valid) "cfg" yet: build it from the legacy per-key values, applying the
+  // exact same defaults the old getters used. On a fresh device every isKey()
+  // is false, so this just keeps the defaults set above.
+  if (s_prefs.isKey(LK_SCR_TO))       s_cfg.scr_to_s     = s_prefs.getUShort(LK_SCR_TO, DEFAULT_SCREEN_TIMEOUT_S);
+  if (s_prefs.isKey(LK_BRIGHTNESS))   s_cfg.bright       = s_prefs.getUChar(LK_BRIGHTNESS, DEFAULT_BRIGHTNESS);
+  if (s_prefs.isKey(LK_KB_BL))        s_cfg.kb_bl        = s_prefs.getUChar(LK_KB_BL, DEFAULT_KB_BL);
+  if (s_prefs.isKey(LK_KB_LAYOUT))    s_cfg.kb_layout    = s_prefs.getUChar(LK_KB_LAYOUT, DEFAULT_KB_LAYOUT);
+  if (s_prefs.isKey(LK_KB_SECONDARY)) s_cfg.kb_secondary = s_prefs.getUChar(LK_KB_SECONDARY, DEFAULT_KB_SECONDARY);
+  if (s_prefs.isKey(LK_TIME_OFFS))    s_cfg.time_offs    = s_prefs.getChar(LK_TIME_OFFS, 0);
+  if (s_prefs.isKey(LK_LOCK_COLOR))   s_cfg.lock_color   = s_prefs.getUInt(LK_LOCK_COLOR, DEFAULT_LOCK_COLOR) & 0xFFFFFFu;
+  if (s_prefs.isKey(LK_ACCENT))       s_cfg.accent       = s_prefs.getUInt(LK_ACCENT, DEFAULT_ACCENT) & 0xFFFFFFu;
+  if (s_prefs.isKey(LK_CLR_BUBBLES))  s_cfg.clr_bubbles  = s_prefs.getBool(LK_CLR_BUBBLES, true) ? 1 : 0;
+  if (s_prefs.isKey(LK_KB_ACCENT))    s_cfg.kb_accent    = s_prefs.getBool(LK_KB_ACCENT, true) ? 1 : 0;
+  if (s_prefs.isKey(LK_DC_SHOW))      s_cfg.dc_show      = s_prefs.getBool(LK_DC_SHOW, DEFAULT_DC_SHOW) ? 1 : 0;
+  if (s_prefs.isKey(LK_USE_MILES))    s_cfg.use_miles    = s_prefs.getBool(LK_USE_MILES, false) ? 1 : 0;
+  if (s_prefs.isKey(LK_TILES_FROM_SD))s_cfg.tiles_from_sd= s_prefs.getBool(LK_TILES_FROM_SD, false) ? 1 : 0;
+  if (s_prefs.isKey(LK_UI_LANG))      s_cfg.ui_lang      = s_prefs.getUChar(LK_UI_LANG, 0);
+  if (s_prefs.isKey(LK_UI_ROTATION))  s_cfg.ui_rotation  = s_prefs.getUChar(LK_UI_ROTATION, 0);
+  if (s_prefs.isKey(LK_BATT_FULL))    s_cfg.batt_full_mv = s_prefs.getUShort(LK_BATT_FULL, 0);
+  if (s_prefs.isKey(LK_GPS_BAUD))     s_cfg.gps_baud     = s_prefs.getUInt(LK_GPS_BAUD, 0);
+  // Enabled-layout mask: legacy used 0xFFFF as the "never written" sentinel and
+  // derived a one-bit mask from the secondary layout. Reproduce that here.
+  {
+    uint16_t v = s_prefs.isKey(LK_KB_ENABLED) ? s_prefs.getUShort(LK_KB_ENABLED, 0xFFFF) : 0xFFFF;
+    if (v == 0xFFFF) {
+      uint8_t sec = s_cfg.kb_secondary;
+      s_cfg.kb_enabled = (sec != 0 && sec < 16) ? (uint16_t)(1u << sec) : 0;
+    } else {
+      s_cfg.kb_enabled = v;
+    }
+  }
+
+  // Write "cfg" ONCE. Only after a durable write do we reclaim the legacy keys.
+  // If the write fails (e.g. NVS full / SD missing) we keep the legacy keys
+  // intact and retry the whole migration on the next boot.
+  if (cfgFlush()) {
+    s_prefs.end();
+    if (s_prefs.begin(TOUCH_NS, false)) {
+      const char* legacy[] = {
+        LK_SCR_TO, LK_DC_SHOW, LK_BRIGHTNESS, LK_KB_BL, LK_KB_LAYOUT,
+        LK_KB_SECONDARY, LK_KB_ENABLED, LK_LOCK_COLOR, LK_CLR_BUBBLES,
+        LK_KB_ACCENT, LK_ACCENT, LK_TIME_OFFS, LK_USE_MILES, LK_TILES_FROM_SD,
+        LK_UI_LANG, LK_UI_ROTATION, LK_BATT_FULL, LK_GPS_BAUD,
+      };
+      for (const char* k : legacy) {
+        if (s_prefs.isKey(k)) s_prefs.remove(k);
+      }
+      s_prefs.end();
+    }
+    s_begun = s_prefs.begin(TOUCH_NS, true);
+  }
+  s_cfg_loaded = true;
+}
+
 void touchPrefsBegin() {
-  if (s_begun) return;
+  if (s_begun) {
+    if (!s_cfg_loaded) cfgLoadOrMigrate();
+    return;
+  }
   s_begun = s_prefs.begin(TOUCH_NS, true);
   if (!s_begun) {
     /* Namespace may not exist yet — open RW once to create it, then reopen RO. */
@@ -25,6 +226,7 @@ void touchPrefsBegin() {
       s_begun = s_prefs.begin(TOUCH_NS, true);
     }
   }
+  if (s_begun) cfgLoadOrMigrate();
 }
 
 // Arduino's Preferences::getString()/getBytes() emit an [E] nvs_get_* "NOT_FOUND"
@@ -38,25 +240,18 @@ static String prefsGetStr(const char* key, const String& def) {
 
 uint16_t touchPrefsGetScreenTimeoutSecs() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUShort(KEY_SCR_TO, DEFAULT_SCREEN_TIMEOUT_S);
+  return s_cfg.scr_to_s;
 }
 
 bool touchPrefsSetScreenTimeoutSecs(uint16_t seconds) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUShort(KEY_SCR_TO, seconds) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.scr_to_s = seconds;
+  return cfgFlush();
 }
-
-static const char* KEY_BRIGHTNESS = "bright";
-static const uint8_t DEFAULT_BRIGHTNESS = 100;
 
 uint8_t touchPrefsGetBrightness() {
   if (!s_begun) touchPrefsBegin();
-  uint8_t v = s_prefs.getUChar(KEY_BRIGHTNESS, DEFAULT_BRIGHTNESS);
+  uint8_t v = s_cfg.bright;
   if (v < 5)   v = 5;
   if (v > 100) v = 100;
   return v;
@@ -66,94 +261,57 @@ bool touchPrefsSetBrightness(uint8_t pct) {
   if (pct < 5)   pct = 5;
   if (pct > 100) pct = 100;
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_BRIGHTNESS, pct) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.bright = pct;
+  return cfgFlush();
 }
-
-static const char* KEY_KB_BL = "kb_bl";
-static const uint8_t DEFAULT_KB_BL = 2;   // auto
 
 uint8_t touchPrefsGetKbBacklight() {
   if (!s_begun) touchPrefsBegin();
-  uint8_t v = s_prefs.getUChar(KEY_KB_BL, DEFAULT_KB_BL);
+  uint8_t v = s_cfg.kb_bl;
   return v > 2 ? DEFAULT_KB_BL : v;
 }
 
 bool touchPrefsSetKbBacklight(uint8_t mode) {
   if (mode > 2) mode = DEFAULT_KB_BL;
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_KB_BL, mode) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.kb_bl = mode;
+  return cfgFlush();
 }
-
-static const char* KEY_KB_LAYOUT = "kblang";
-static const uint8_t DEFAULT_KB_LAYOUT = 0;   // English
 
 uint8_t touchPrefsGetKeyboardLayout() {
   if (!s_begun) touchPrefsBegin();
-  uint8_t v = s_prefs.getUChar(KEY_KB_LAYOUT, DEFAULT_KB_LAYOUT);
-  return v;
+  return s_cfg.kb_layout;
 }
 
 bool touchPrefsSetKeyboardLayout(uint8_t layout) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_KB_LAYOUT, layout) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.kb_layout = layout;
+  return cfgFlush();
 }
-
-static const char* KEY_KB_SECONDARY = "kbsec";
-static const uint8_t DEFAULT_KB_SECONDARY = 0;   // None
 
 uint8_t touchPrefsGetSecondaryKeyboard() {
   if (!s_begun) touchPrefsBegin();
-  uint8_t v = s_prefs.getUChar(KEY_KB_SECONDARY, DEFAULT_KB_SECONDARY);
-  return v;
+  return s_cfg.kb_secondary;
 }
 
 bool touchPrefsSetSecondaryKeyboard(uint8_t secondary) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_KB_SECONDARY, secondary) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.kb_secondary = secondary;
+  return cfgFlush();
 }
-
-static const char* KEY_KB_ENABLED = "kbenab";
 
 uint16_t touchPrefsGetEnabledLayouts() {
   if (!s_begun) touchPrefsBegin();
-  // 0xFFFF is never a valid mask (only 7 low bits are used), so use it as the
-  // "never written" sentinel: migrate the legacy single-secondary into a mask.
-  uint16_t v = s_prefs.getUShort(KEY_KB_ENABLED, 0xFFFF);
-  if (v == 0xFFFF) {
-    uint8_t sec = s_prefs.getUChar(KEY_KB_SECONDARY, 0);
-    return (sec != 0 && sec < 16) ? (uint16_t)(1u << sec) : 0;
-  }
-  return v;
+  // The legacy "never written -> derive a one-bit mask from the secondary
+  // layout" migration ran once at cfg-migration time (see cfgLoadOrMigrate);
+  // the resolved mask now lives in s_cfg.kb_enabled.
+  return s_cfg.kb_enabled;
 }
 
 bool touchPrefsSetEnabledLayouts(uint16_t mask) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUShort(KEY_KB_ENABLED, mask) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.kb_enabled = mask;
+  return cfgFlush();
 }
 
 static const char* KEY_TILE_SRV = "tile_srv";
@@ -268,11 +426,9 @@ bool touchPrefsSetLockWallpaper(const char* path) {
   return ok;
 }
 
-static const char* KEY_TIME_OFFS = "time_offs";
-
 int touchPrefsGetTimeOffsetHours() {
   if (!s_begun) touchPrefsBegin();
-  int v = (int)s_prefs.getChar(KEY_TIME_OFFS, 0);
+  int v = (int)s_cfg.time_offs;
   if (v < -23) v = -23;
   if (v >  23) v =  23;
   return v;
@@ -281,12 +437,8 @@ bool touchPrefsSetTimeOffsetHours(int hours) {
   if (hours < -23) hours = -23;
   if (hours >  23) hours =  23;
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putChar(KEY_TIME_OFFS, (int8_t)hours) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.time_offs = (int8_t)hours;
+  return cfgFlush();
 }
 void touchPrefsBuildLocalTz(char* out, int out_cap) {
   if (!out || out_cap <= 0) return;
@@ -297,77 +449,52 @@ void touchPrefsBuildLocalTz(char* out, int out_cap) {
   snprintf(out, out_cap, "CET%dCEST,M3.5.0,M10.5.0/3", -(1 + off));
 }
 
-static const char* KEY_LOCK_COLOR = "lk_col";
-static const uint32_t DEFAULT_LOCK_COLOR = 0xE6F2FFu;   // soft white
-
 uint32_t touchPrefsGetLockTextColor() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUInt(KEY_LOCK_COLOR, DEFAULT_LOCK_COLOR) & 0xFFFFFFu;
+  return s_cfg.lock_color & 0xFFFFFFu;
 }
 
 bool touchPrefsSetLockTextColor(uint32_t rgb) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUInt(KEY_LOCK_COLOR, rgb & 0xFFFFFFu) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.lock_color = rgb & 0xFFFFFFu;
+  return cfgFlush();
 }
 
 // Colourful chat bubbles: colour each bubble + sender name by a hash of the
-// sender's display name (same name -> same colour). Default ON. (getBool is
-// log_v on a miss, so no NOT_FOUND console spam.)
-static const char* KEY_CLR_BUBBLES = "clr_bub";
+// sender's display name (same name -> same colour). Default ON.
 bool touchPrefsGetColorfulBubbles() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getBool(KEY_CLR_BUBBLES, true);
+  return s_cfg.clr_bubbles != 0;
 }
 bool touchPrefsSetColorfulBubbles(bool on) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putBool(KEY_CLR_BUBBLES, on) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.clr_bubbles = on ? 1 : 0;
+  return cfgFlush();
 }
 
 // Keyboard accent-popup picker: when a typed Latin letter has accented variants,
-// a tap-to-pick box appears. Default ON. (getBool is log_v on a miss, so no
-// NOT_FOUND console spam.) Key is distinct from KEY_ACCENT (the theme colour).
-static const char* KEY_KB_ACCENT = "kb_accent";
+// a tap-to-pick box appears. Default ON. (Distinct from the accent THEME colour.)
 bool touchPrefsGetAccentPopups() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getBool(KEY_KB_ACCENT, true);
+  return s_cfg.kb_accent != 0;
 }
 bool touchPrefsSetAccentPopups(bool on) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putBool(KEY_KB_ACCENT, on) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.kb_accent = on ? 1 : 0;
+  return cfgFlush();
 }
 
 // UI accent colour (buttons, active tab, keyboard, highlights) as 0xRRGGBB.
 // Default = the WADAMESH brand teal (the logo dots). The picker clamps it dark
 // enough that the off-white button text stays readable on any hue.
-static const char* KEY_ACCENT = "accent";
-static const uint32_t DEFAULT_ACCENT = 0x15B6A6u;
 uint32_t touchPrefsGetAccentColor() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUInt(KEY_ACCENT, DEFAULT_ACCENT) & 0xFFFFFFu;
+  return s_cfg.accent & 0xFFFFFFu;
 }
 bool touchPrefsSetAccentColor(uint32_t rgb) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUInt(KEY_ACCENT, rgb & 0xFFFFFFu) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.accent = rgb & 0xFFFFFFu;
+  return cfgFlush();
 }
 
 // Quick-reply macros. Stored as NVS strings keyed "qr0".."qr5".
@@ -410,50 +537,35 @@ int touchPrefsGetQuickReply(int idx, char* out, int out_cap) {
 
 bool touchPrefsGetDutyMeterShown() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getBool(KEY_DC_SHOW, DEFAULT_DC_SHOW);
+  return s_cfg.dc_show != 0;
 }
 
 bool touchPrefsSetDutyMeterShown(bool show) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putBool(KEY_DC_SHOW, show);
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.dc_show = show ? 1 : 0;
+  return cfgFlush();
 }
-
-static const char* KEY_USE_MILES = "use_miles";
-static const char* KEY_TILES_FROM_SD = "tiles_sd";
 
 bool touchPrefsGetUseMiles() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getBool(KEY_USE_MILES, false);   // default = km
+  return s_cfg.use_miles != 0;   // default = km
 }
 
 bool touchPrefsSetUseMiles(bool use_miles) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putBool(KEY_USE_MILES, use_miles);
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.use_miles = use_miles ? 1 : 0;
+  return cfgFlush();
 }
 
 bool touchPrefsGetTilesFromSd() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getBool(KEY_TILES_FROM_SD, false);   // default = tile server
+  return s_cfg.tiles_from_sd != 0;   // default = tile server
 }
 
 bool touchPrefsSetTilesFromSd(bool from_sd) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putBool(KEY_TILES_FROM_SD, from_sd);
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.tiles_from_sd = from_sd ? 1 : 0;
+  return cfgFlush();
 }
 
 // Store ALL device data (identity, prefs, contacts, channels) on the SD card
@@ -478,56 +590,39 @@ bool touchPrefsSetUseSdStorage(bool use_sd) {
 }
 
 // UI language index (UiLang enum in i18n.h; 0 = English). Read at boot to pick
-// the active translation language. Key "ui_lang" in the "touch" namespace.
-static const char* KEY_UI_LANG = "ui_lang";
+// the active translation language. Packed into the "cfg" blob.
 uint8_t touchPrefsGetUiLang() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUChar(KEY_UI_LANG, 0);   // default = English
+  return s_cfg.ui_lang;   // default = English
 }
 bool touchPrefsSetUiLang(uint8_t lang) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_UI_LANG, lang) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.ui_lang = lang;
+  return cfgFlush();
 }
-
-static const char* KEY_UI_ROTATION = "uirot";
 
 uint8_t touchPrefsGetUiRotation() {
   if (!s_begun) touchPrefsBegin();
-  uint8_t r = s_prefs.getUChar(KEY_UI_ROTATION, 0);   // default = portrait
+  uint8_t r = s_cfg.ui_rotation;   // default = portrait
   return (r <= 3) ? r : 0;
 }
 
 bool touchPrefsSetUiRotation(uint8_t rot) {
   if (rot > 3) rot = 0;
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUChar(KEY_UI_ROTATION, rot);
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.ui_rotation = rot;
+  return cfgFlush();
 }
-
-static const char* KEY_BATT_FULL = "battfull";
 
 uint16_t touchPrefsGetBattFullMv() {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUShort(KEY_BATT_FULL, 0);   // 0 = not calibrated -> default 4200
+  return s_cfg.batt_full_mv;   // 0 = not calibrated -> default 4200
 }
 
 bool touchPrefsSetBattFullMv(uint16_t mv) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUShort(KEY_BATT_FULL, mv) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.batt_full_mv = mv;
+  return cfgFlush();
 }
 
 // Wi-Fi profile slots ----------------------------------------------------
@@ -884,21 +979,17 @@ bool touchPrefsSetSetupDone(bool done) {
   return ok;
 }
 
-static const char* KEY_GPS_BAUD = "gps_baud";
-
 uint32_t touchPrefsGetGpsBaud(uint32_t fallback) {
   if (!s_begun) touchPrefsBegin();
-  return s_prefs.getUInt(KEY_GPS_BAUD, fallback);
+  // 0 = never set -> caller's compile-time default. A real configured baud is
+  // always non-zero, so this preserves the old "absent key -> fallback" result.
+  return s_cfg.gps_baud != 0 ? s_cfg.gps_baud : fallback;
 }
 
 bool touchPrefsSetGpsBaud(uint32_t baud) {
   if (!s_begun) touchPrefsBegin();
-  s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) return false;
-  bool ok = s_prefs.putUInt(KEY_GPS_BAUD, baud) > 0;
-  s_prefs.end();
-  s_begun = s_prefs.begin(TOUCH_NS, true);
-  return ok;
+  s_cfg.gps_baud = baud;
+  return cfgFlush();
 }
 
 #endif
