@@ -18081,7 +18081,33 @@ static void powerOffCb(lv_event_t* e) {
 #endif
 }
 
-// Open the power menu: a small centred card with Power off / Reboot / Cancel.
+#if defined(ESP32)
+#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_FORCE_DOWNLOAD_BOOT (header-guarded)
+// Force the ROM serial bootloader (USB download / flash mode) on the next reset,
+// so the device can be reflashed over USB without holding BOOT + tapping RST. The
+// force-download bit lives in the RTC domain (it survives the soft reset);
+// esptool's post-flash reset — or a power cycle — clears it back to a normal boot.
+static void rebootToDownloadMode() {
+  REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  ESP.restart();
+}
+#endif
+
+static void powerDownloadCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closePowerMenu();
+#if defined(ESP32)
+  if (g_lv.task) {
+    g_lv.task->persistHistoryNow();   // flush chat before we go down
+    g_lv.task->showAlert(TR("Download mode\xE2\x80\xA6 reflash over USB"), 1500);
+  }
+  lv_refr_now(NULL);
+  delay(900);
+  rebootToDownloadMode();   // never returns
+#endif
+}
+
+// Open the power menu: a small centred card with Power off / Reboot / Download / Cancel.
 static void openPowerMenu() {
   closeControlCenter();
   closePowerMenu();
@@ -18099,8 +18125,8 @@ static void openPowerMenu() {
   const int card_w = (sw - 40 > 240) ? 240 : (sw - 40);
   lv_obj_t* card = lv_obj_create(s_power_menu);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, 188);
-  lv_obj_align(card, LV_ALIGN_CENTER, 0, -10);
+  lv_obj_set_size(card, card_w, 206);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   styleSurface(card, COLOR_PANEL, 10);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
@@ -18115,7 +18141,7 @@ static void openPowerMenu() {
 
   auto mk = [&](const char* txt, lv_event_cb_t cb, uint32_t bg, int y) {
     lv_obj_t* b = lv_btn_create(card);
-    lv_obj_set_size(b, card_w - 24, 40);
+    lv_obj_set_size(b, card_w - 24, 34);
     lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
     styleButton(b);
     if (bg) {
@@ -18130,9 +18156,10 @@ static void openPowerMenu() {
     lv_obj_center(l);
     return b;
   };
-  mk(LV_SYMBOL_POWER "  Power off", powerOffCb,    0xC44B55, 30);
-  mk(LV_SYMBOL_REFRESH "  Reboot",  powerRebootCb, 0,        78);
-  mk("Cancel",                      powerCancelCb, 0,        126);
+  mk(LV_SYMBOL_POWER "  Power off",        powerOffCb,      0xC44B55, 28);
+  mk(LV_SYMBOL_REFRESH "  Reboot",         powerRebootCb,   0,        68);
+  mk(LV_SYMBOL_DOWNLOAD "  Download mode", powerDownloadCb, 0,        108);
+  mk("Cancel",                             powerCancelCb,   0,        148);
 }
 
 static void ccPowerCb(lv_event_t* e) {
@@ -19051,13 +19078,23 @@ static void buildBootSplash() {
   lv_obj_align(wm, LV_ALIGN_CENTER, 0, 60);   // below the now-centred mark
   lv_obj_set_style_opa(wm, LV_OPA_TRANSP, LV_PART_MAIN);
 
+  // ---- Product line: MESHCOMOD (small, same size as the channel line, between
+  //      the WADAMESH wordmark and TOUCH BETA) ----
+  lv_obj_t* mc = lv_label_create(s_splash_root);
+  lv_label_set_text(mc, "MESHCOMOD");
+  lv_obj_set_style_text_font(mc, &lv_font_unscii_8, LV_PART_MAIN);
+  lv_obj_set_style_text_color(mc, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(mc, 4, LV_PART_MAIN);
+  lv_obj_align(mc, LV_ALIGN_CENTER, 0, 78);
+  lv_obj_set_style_opa(mc, LV_OPA_TRANSP, LV_PART_MAIN);
+
   // ---- Subtitle: build channel ----
   lv_obj_t* sub = lv_label_create(s_splash_root);
   lv_label_set_text(sub, TR("TOUCH BETA"));
   lv_obj_set_style_text_font(sub, &lv_font_unscii_8, LV_PART_MAIN);
   lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sub, 4, LV_PART_MAIN);
-  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 82);
+  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 92);
   lv_obj_set_style_opa(sub, LV_OPA_TRANSP, LV_PART_MAIN);
 
   // (No mark fade — it's shown at full opacity above, replacing the identical
@@ -19073,6 +19110,17 @@ static void buildBootSplash() {
   lv_anim_set_exec_cb(&aw, splashSetOpa);
   lv_anim_set_path_cb(&aw, lv_anim_path_ease_out);
   lv_anim_start(&aw);
+
+  // Phase 2.5: the MESHCOMOD product line fades in between wordmark + subtitle.
+  lv_anim_t am;
+  lv_anim_init(&am);
+  lv_anim_set_var(&am, mc);
+  lv_anim_set_time(&am, 450);
+  lv_anim_set_delay(&am, 450);
+  lv_anim_set_values(&am, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_exec_cb(&am, splashSetOpa);
+  lv_anim_set_path_cb(&am, lv_anim_path_ease_out);
+  lv_anim_start(&am);
 
   // Phase 3: subtitle fades in last.
   lv_anim_t as;
