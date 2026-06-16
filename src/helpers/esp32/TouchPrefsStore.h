@@ -80,6 +80,11 @@ bool touchPrefsSetUseMiles(bool use_miles);
 bool touchPrefsGetTilesFromSd();
 bool touchPrefsSetTilesFromSd(bool from_sd);
 
+/** Hide the device/profile name in the status bar and move the clock to the
+ *  left where the name used to be. Default false (name shown). */
+bool touchPrefsGetHideNodeName();
+bool touchPrefsSetHideNodeName(bool hide);
+
 /** Store all device data (identity/prefs/contacts/channels) on the SD card under
  *  /meshcomod instead of internal SPIFFS. T-Deck only; read at boot before data
  *  loads, so changing it requires a reboot. Default false (SPIFFS). */

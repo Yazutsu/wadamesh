@@ -5665,6 +5665,18 @@ static void scrollReverseToggleCb(lv_event_t* e) {
 }
 #endif
 
+// Hide the device/profile name in the status bar and park the clock on the left
+// where the name used to be. Applies immediately via updateGlobalStatusBar().
+static void hideNameToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool hide = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetHideNodeName(hide);
+#endif
+  updateGlobalStatusBar();   // hide/show the name + reposition the clock now
+  if (g_lv.task) g_lv.task->showAlert(hide ? TR("Device name hidden") : TR("Device name shown"), 1000);
+}
+
 // Colourful chat bubbles toggle. On enable: the "taste the rainbow" easter egg.
 // Bubbles recolour the next time a chat opens (this control lives on Settings).
 static void colorfulBubblesToggleCb(lv_event_t* e) {
@@ -6094,6 +6106,19 @@ static void buildDeviceSettings(int sec) {
     if (touchPrefsGetColorfulBubbles()) lv_obj_add_state(sw, LV_STATE_CHECKED);
 #endif
     lv_obj_add_event_cb(sw, colorfulBubblesToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+  }
+
+  /* Hide device name: blank the scrolling profile name in the status bar and
+     move the clock to the left where it sat. */
+  {
+    int h = settingsRowLabel(body, y, 6, "Hide device name", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetHideNodeName()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, hideNameToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
 
@@ -21195,6 +21220,12 @@ static void updateGlobalStatusBar() {
     if (tab == MAP_TAB_INDEX) {
       // On the immersive map the left zone carries the required OSM attribution.
       lv_label_set_text(g_statusbar.left_label, TR("\xC2\xA9 OpenStreetMap"));
+    } else if (tab == HOME_TAB_INDEX && touchPrefsGetHideNodeName()) {
+      // Display setting: hide the device name. Clear the left zone — the clock is
+      // parked here instead (see the clock-placement block below).
+      lv_label_set_text(g_statusbar.left_label, TR(""));
+      s_left_home_name[0] = '\0';   // force marquee re-config if the name returns
+      s_left_home_cfg = false;
     } else if (tab == HOME_TAB_INDEX) {
       // Home: the user's profile name, capped to a ~11-char-wide window. Longer
       // names marquee-scroll so they never run into the status icons. Reconfigure
@@ -21330,6 +21361,26 @@ static void updateGlobalStatusBar() {
     }
   }
 #endif
+
+  // ---- Clock placement ----
+  // When the device name is hidden on Home (display setting) the left zone is
+  // free, so park the clock there. Otherwise it sits top-right; charging slides
+  // it +32 to hug the bolt once the % column hides. Re-aligned only on a state
+  // change (tab / setting / charging) so it isn't laid out every tick.
+  {
+    int ctab = g_lv.tabview ? (int)lv_tabview_get_tab_act(g_lv.tabview) : -1;
+    const bool name_hidden_home = touchPrefsGetHideNodeName()
+                                  && s_settings_open_cat < 0 && s_chat_title[0] == '\0'
+                                  && ctab == HOME_TAB_INDEX;
+    static int8_t s_clk_left = -1;     // -1 = unset -> forces the first align
+    static bool   s_clk_chg  = false;
+    const int8_t want = name_hidden_home ? 1 : 0;
+    if (want != s_clk_left || (!want && charging != s_clk_chg)) {
+      s_clk_left = want; s_clk_chg = charging;
+      if (want) lv_obj_align(g_statusbar.clock, LV_ALIGN_LEFT_MID, 6, 0);
+      else      lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, charging ? -94 : -126, 0);
+    }
+  }
 
   // ---- Layout indicator ----
   if (g_statusbar.layout_label) {
