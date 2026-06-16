@@ -255,14 +255,17 @@ constexpr uint32_t COLOR_STATUS_DANGER= 0xA04040;  // muted red
 #define TOUCH_SYM_STAR_BIG "\xE2\x98\x85"  /* render ONLY with star_font_28    */
 extern "C" const lv_font_t star_font_28;
 extern "C" const lv_font_t star_font_14;
-// FontAwesome glyphs (monochrome, bpp4) carried by person_font: U+F007 "user"
-// and U+F519 "tower-broadcast". Spliced into the g_font_16 fallback chain in
-// initTouchFontFallbacks, so these PUA codepoints render an icon that follows
-// the label's text colour. Used for the Contacts tab icon (person) and the
-// Contacts-list type icons (person = peer, antenna = repeater).
-extern "C" const lv_font_t person_font;
+// FontAwesome glyphs (monochrome, bpp4) carried by person_font: U+F007 "user",
+// U+F519 "tower-broadcast", U+F0C0 "users" (group). Spliced into the g_font_16
+// and g_font_14 fallback chains in initTouchFontFallbacks, so these PUA codepoints
+// render an icon that follows the label's text colour. Used for the Contacts tab
+// icon (person), the Contacts-list type icons (person = peer, antenna = repeater),
+// and the Chats list (person = DM, group = channel).
+extern "C" const lv_font_t person_font;     // 16 px — for g_font_16 contexts
+extern "C" const lv_font_t person_font14;   // 14 px — for g_font_14 (chat list rows)
 #define TOUCH_SYM_PERSON  "\xEF\x80\x87"   /* U+F007 user */
 #define TOUCH_SYM_ANTENNA "\xEF\x94\x99"   /* U+F519 tower-broadcast */
+#define TOUCH_SYM_GROUP   "\xEF\x83\x80"   /* U+F0C0 users (group) */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -327,11 +330,13 @@ static void initTouchFontFallbacks() {
   s_person_font = person_font;
   s_person_font.fallback = g_font_16.fallback;
   g_font_16.fallback = &s_person_font;
-  // Also reach the person/antenna glyphs from g_font_14 — the contact action
-  // sheet renders its title icon inline with the name in that font. fallback is
-  // only consulted on a glyph miss, so normal 14 px text pays nothing.
+  // Also reach the person/antenna/group glyphs from g_font_14 — the contact
+  // action sheet title and the Chats-list rows render the icon inline with 14 px
+  // text. Use the 14 px-rendered person_font14 (NOT the 16 px person_font) so the
+  // glyph matches the line height instead of overshooting + clipping at the top.
+  // fallback is only consulted on a glyph miss, so normal 14 px text pays nothing.
   static lv_font_t s_person_font14;
-  s_person_font14 = person_font;
+  s_person_font14 = person_font14;
   s_person_font14.fallback = g_font_14.fallback;
   g_font_14.fallback = &s_person_font14;
 }
@@ -2853,8 +2858,7 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, pad, LV_PART_MAIN);
-  if (card_scroll) lv_obj_set_scroll_dir(card, LV_DIR_VER);
-  else             lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);   // header stays fixed; the body below scrolls
   addCloseXBadge(card, channelLongSheetDismissCb);
 
   lv_obj_t* title = lv_label_create(card);
@@ -2869,9 +2873,20 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   lv_obj_set_width(title, card_w - 2 * pad - 32);
   lv_obj_set_pos(title, 0, 0);
 
-  int y = 28;
+  // Scrollable body BELOW the fixed title + X header. The buttons live here and
+  // are clipped to the body's bounds, so the floating X (pinned to the card's
+  // top-right) is never drawn on top of a button as the list scrolls.
+  lv_obj_t* body = lv_obj_create(card);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_pos(body, 0, 28);
+  lv_obj_set_size(body, card_w - 2 * pad, card_h - 2 * pad - 28);
+  lv_obj_set_style_pad_all(body, 0, LV_PART_MAIN);
+  if (card_scroll) lv_obj_set_scroll_dir(body, LV_DIR_VER);
+  else             lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+  int y = 0;
   auto mk = [&](const char* lbl, lv_event_cb_t cb, uint32_t bg) -> lv_obj_t* {
-    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_t* b = lv_btn_create(body);
     lv_obj_set_size(b, card_w - 2 * pad, btn_h);
     lv_obj_set_pos(b, 0, y);
     styleButton(b);
@@ -12128,6 +12143,319 @@ static void openSignalInfoPopup() {
   lv_obj_set_style_text_font(tlbl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_pos(tlbl, 0, cy);
 }
+
+// ============================================================
+// RF Monitor app  (app-drawer tile -> APPACT_MONITOR)
+// ============================================================
+// A companion-side RF/mesh sniffer + "repeater dashboard": the kind of live
+// radio insight a repeater operator gets on their node, brought to the touch
+// companion so a hybrid-CP user can see how well their node is hearing the
+// mesh. Three parts, top to bottom:
+//   1) a live channel-RSSI strip - instantaneous RSSI on the home frequency
+//      over a noise-floor baseline (the "scope"). Idle sits near the floor; a
+//      packet mid-reception spikes the cyan trace up.
+//   2) key metrics - noise floor / current / peak-hold RSSI, the LINK MARGIN of
+//      the last packet heard (its RSSI above the noise floor, colour-graded:
+//      green >=10 dB, amber 3-10, red <3 - the single most actionable number),
+//      and the live packet rate.
+//   3) a "Recently heard" feed - the last 16 received frames with type
+//      (TXT/ADV/ACK/TRC...), RSSI, SNR and hop count, so you can watch exactly
+//      what the radio is pulling out of the air in real time.
+// Data comes from the_mesh's recent-RX ring (filled in logRxRaw) plus a couple
+// of read-only radio registers. getCurrentRSSI()/getNoiseFloor() poke the LoRa
+// SPI bus, which is safe here ONLY because ui_task.loop() (where lv_timer
+// callbacks run) and the_mesh.loop() execute sequentially in the same loop()
+// task - never concurrently - so there is no SPI contention. A true
+// frequency-domain sweep would need core access to re-arm RX at each swept
+// frequency (startRecv() is protected) and is deferred to a core change.
+static const int MON_RSSI_MIN = -130;   // chart Y floor (dBm)
+static const int MON_RSSI_MAX = -20;    // chart Y ceiling (dBm)
+
+static lv_obj_t*          s_monitor_root    = nullptr;
+static lv_obj_t*          s_mon_chart       = nullptr;
+static lv_chart_series_t* s_mon_ser         = nullptr;   // live channel RSSI (cyan)
+static lv_chart_series_t* s_mon_nf_ser      = nullptr;   // noise-floor baseline (grey)
+static lv_obj_t*          s_mon_metrics_lbl = nullptr;   // noise/now/peak + margin + rate
+static lv_obj_t*          s_mon_feed_lbl    = nullptr;   // "Recently heard" feed (recolour)
+static lv_timer_t*        s_mon_timer       = nullptr;
+static float              s_mon_peak        = -200.0f;   // peak-hold (dBm), slow decay
+
+// 3-letter code + colour per MeshCore payload type (raw[0]>>2 & 0x0F).
+static const char* monPtypeName(uint8_t t) {
+  switch (t) {
+    case 0x00: return "REQ"; case 0x01: return "RSP"; case 0x02: return "TXT";
+    case 0x03: return "ACK"; case 0x04: return "ADV"; case 0x05: return "GRP";
+    case 0x06: return "GDT"; case 0x07: return "ANR"; case 0x08: return "PTH";
+    case 0x09: return "TRC"; case 0x0A: return "MUL"; case 0x0B: return "CTL";
+    case 0x0F: return "RAW"; default: return "?";
+  }
+}
+static uint32_t monPtypeColor(uint8_t t) {
+  switch (t) {
+    case 0x02: case 0x05: return 0x35C9C9;  // TXT / group text - cyan
+    case 0x04:            return 0xC9A227;  // ADV (advert)      - amber
+    case 0x03:            return 0x6FCF6F;  // ACK               - green
+    case 0x09: case 0x08: return 0xBB86FC;  // TRC / PTH (route) - purple
+    case 0x00: case 0x01: return 0x9AA0A6;  // REQ / RSP         - grey
+    default:              return 0xC0C4C8;  // others            - off-white
+  }
+}
+
+static void monitorBuildMetrics() {
+  if (!s_mon_metrics_lbl) return;
+  const int now_r = (int)radio_driver.getCurrentRSSI();
+  const int nf    = radio_driver.getNoiseFloor();
+  const uint32_t sms = the_mesh.uiSignalMs();
+  const bool heard   = (sms != 0);
+  const int  l_rssi  = the_mesh.uiSignalRssi();
+  const int  margin  = heard ? (l_rssi - nf) : 0;   // last packet's fade margin (dB)
+
+  // Live packet rate from the ring span (self-scales even when the ring is full)
+  int rate = 0;
+  const uint8_t cnt = the_mesh.uiRxLogCount();
+  if (cnt >= 2) {
+    MyMesh::UiRxRec newest, oldest;
+    if (the_mesh.uiRxLogGet(0, newest) && the_mesh.uiRxLogGet((uint8_t)(cnt - 1), oldest)) {
+      const uint32_t span = newest.ms - oldest.ms;
+      if (span > 0) rate = (int)(((uint32_t)(cnt - 1) * 60000UL) / span);
+    }
+  }
+  const uint32_t rxtot = radio_driver.getPacketsRecv();
+  const uint32_t mcol  = margin >= 10 ? 0x6FCF6F : margin >= 3 ? 0xC9A227 : 0xD05050;
+
+  const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+  char b[240];
+  if (narrow) {                                   // V4 portrait: 3 short lines
+    if (heard)
+      snprintf(b, sizeof b,
+        "Noise %d   Now %d\n"
+        "Peak %d   Mgn #%06X %+d dB#\n"
+        "RX ~%d/min   %lu rx",
+        nf, now_r, (int)s_mon_peak, (unsigned)mcol, margin, rate, (unsigned long)rxtot);
+    else
+      snprintf(b, sizeof b,
+        "Noise %d   Now %d\n"
+        "Peak %d   Mgn --\n"
+        "RX ~%d/min   %lu rx",
+        nf, now_r, (int)s_mon_peak, rate, (unsigned long)rxtot);
+  } else {                                         // landscape: 2 wide lines
+    if (heard)
+      snprintf(b, sizeof b,
+        "Noise %d    Now %d    Peak %d dBm\n"
+        "Margin #%06X %+d dB#    RX ~%d/min    (%lu rx)",
+        nf, now_r, (int)s_mon_peak, (unsigned)mcol, margin, rate, (unsigned long)rxtot);
+    else
+      snprintf(b, sizeof b,
+        "Noise %d    Now %d    Peak %d dBm\n"
+        "Margin --    RX ~%d/min    (%lu rx)",
+        nf, now_r, (int)s_mon_peak, rate, (unsigned long)rxtot);
+  }
+  lv_label_set_text(s_mon_metrics_lbl, b);
+}
+
+static void monitorBuildFeed() {
+  if (!s_mon_feed_lbl) return;
+  const bool narrow = lv_disp_get_hor_res(nullptr) < 280;
+  const uint8_t n = the_mesh.uiRxLogCount();
+  if (n == 0) {
+    lv_label_set_text(s_mon_feed_lbl, narrow ? "#5A6166 Listening\xE2\x80\xA6#"
+                                             : "#5A6166 Listening \xE2\x80\x94 nothing heard yet#");
+    return;
+  }
+  const uint32_t now = millis();
+  char b[760]; int q = 0;
+  for (uint8_t i = 0; i < n && q < (int)sizeof(b) - 72; i++) {
+    MyMesh::UiRxRec r;
+    if (!the_mesh.uiRxLogGet(i, r)) break;
+    const uint32_t age = now - r.ms;
+    char ago[10];
+    if (age < 60000UL)        snprintf(ago, sizeof ago, "%lus", (unsigned long)(age / 1000));
+    else if (age < 3600000UL) snprintf(ago, sizeof ago, "%lum", (unsigned long)(age / 60000));
+    else                      snprintf(ago, sizeof ago, "%luh", (unsigned long)(age / 3600000UL));
+    char hop[12];
+    if (narrow) {
+      if (r.hops == 0) snprintf(hop, sizeof hop, "dir");
+      else             snprintf(hop, sizeof hop, "%uh", (unsigned)r.hops);
+    } else {
+      if (r.hops == 0) snprintf(hop, sizeof hop, "direct");
+      else             snprintf(hop, sizeof hop, "%u hop%s", (unsigned)r.hops, r.hops == 1 ? "" : "s");
+    }
+    if (narrow)                                   // V4 portrait: drop unit words, tighter columns
+      q += snprintf(b + q, sizeof(b) - q,
+        "%-3s #%06X %-3s# %4d %4.1f %s\n",
+        ago, (unsigned)monPtypeColor(r.ptype), monPtypeName(r.ptype),
+        (int)r.rssi, (double)r.snr_q4 / 4.0, hop);
+    else
+      q += snprintf(b + q, sizeof(b) - q,
+        "%-4s #%06X %-3s#  %4d dBm  %4.1f  %s\n",
+        ago, (unsigned)monPtypeColor(r.ptype), monPtypeName(r.ptype),
+        (int)r.rssi, (double)r.snr_q4 / 4.0, hop);
+  }
+  if (q > 0 && b[q - 1] == '\n') b[q - 1] = '\0';   // trim trailing newline
+  lv_label_set_text(s_mon_feed_lbl, b);
+}
+
+static void monitorTimerCb(lv_timer_t* t) {
+  (void)t;
+  if (!s_monitor_root || !s_mon_chart) return;
+  const float rssi = radio_driver.getCurrentRSSI();
+  if (rssi > s_mon_peak) s_mon_peak = rssi;
+  else                   s_mon_peak -= 0.5f;          // slow decay so it tracks down after a burst
+  int v = (int)rssi;
+  if (v < MON_RSSI_MIN) v = MON_RSSI_MIN;
+  if (v > MON_RSSI_MAX) v = MON_RSSI_MAX;
+  lv_chart_set_next_value(s_mon_chart, s_mon_ser, (lv_coord_t)v);
+  if (s_mon_nf_ser) {
+    int nf = radio_driver.getNoiseFloor();
+    if (nf < MON_RSSI_MIN) nf = MON_RSSI_MIN;
+    if (nf > MON_RSSI_MAX) nf = MON_RSSI_MAX;
+    lv_chart_set_next_value(s_mon_chart, s_mon_nf_ser, (lv_coord_t)nf);
+  }
+  monitorBuildMetrics();
+  monitorBuildFeed();
+}
+
+static void closeMonitorPage() {
+  if (s_mon_timer)    { lv_timer_del(s_mon_timer);        s_mon_timer = nullptr; }
+  if (s_monitor_root) { lv_obj_del_async(s_monitor_root); s_monitor_root = nullptr; }
+  s_mon_chart = nullptr; s_mon_ser = nullptr; s_mon_nf_ser = nullptr;
+  s_mon_metrics_lbl = nullptr; s_mon_feed_lbl = nullptr;
+}
+static void monitorDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  // Close only on the backdrop (root) or the X badge; taps that bubble up from a
+  // child (chart / feed) leave the page open.
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeMonitorPage();
+}
+
+static void openMonitorPage() {
+  closeMonitorPage();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  const int H = sh - STATUSBAR_H;
+  s_monitor_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_monitor_root);
+  lv_obj_set_size(s_monitor_root, sw, H);
+  lv_obj_set_pos(s_monitor_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_monitor_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_monitor_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_monitor_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_monitor_root, monitorDismissCb, LV_EVENT_CLICKED, nullptr);
+  s_mon_peak = radio_driver.getCurrentRSSI();
+
+  lv_obj_t* ttl = lv_label_create(s_monitor_root);
+  lv_label_set_text(ttl, TOUCH_SYM_ANTENNA "  RF Monitor");
+  lv_obj_set_style_text_font(ttl, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ttl, lv_color_hex(0x35C9C9), LV_PART_MAIN);
+  lv_obj_set_pos(ttl, 10, 5);
+  addCloseXBadge(s_monitor_root, monitorDismissCb);
+
+  // ---- radio config line (static; what we're monitoring) ----
+  // Narrow (V4 portrait ~240 wide) drops the unit words + CR so it stays on one
+  // line; landscape (320, e.g. T-Deck) shows the full string.
+  const bool narrow = sw < 280;
+  NodePrefs* pr = the_mesh.getNodePrefs();
+  char cfg[88];
+  if (narrow)
+    snprintf(cfg, sizeof cfg, "%.3f  SF%u  BW%.0f  %+ddBm",
+      pr ? (double)pr->freq : 0.0, pr ? (unsigned)pr->sf : 0u,
+      pr ? (double)pr->bw : 0.0, pr ? (int)pr->tx_power_dbm : 0);
+  else
+    snprintf(cfg, sizeof cfg, "%.3f MHz  SF%u  BW%.0f  CR4/%u  %+ddBm",
+      pr ? (double)pr->freq : 0.0, pr ? (unsigned)pr->sf : 0u,
+      pr ? (double)pr->bw : 0.0,  pr ? (unsigned)pr->cr : 0u,
+      pr ? (int)pr->tx_power_dbm : 0);
+  lv_obj_t* cfgl = lv_label_create(s_monitor_root);
+  lv_label_set_text(cfgl, cfg);
+  lv_obj_set_style_text_font(cfgl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cfgl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(cfgl, 10, 27);
+
+  // ---- live channel-RSSI strip (the "scope") ----
+  // Chart is inset from the left so the dBm axis labels (which LVGL draws to the
+  // LEFT of the chart's outer edge) land in an on-screen gutter, not off-screen.
+  const int chart_x = 40;
+  const int chart_y = 44;
+  const int chart_w = sw - chart_x - 10;
+  const int chart_h = H * 28 / 100;                // ~28% of the page height
+  s_mon_chart = lv_chart_create(s_monitor_root);
+  lv_obj_set_size(s_mon_chart, chart_w, chart_h);
+  lv_obj_set_pos(s_mon_chart, chart_x, chart_y);
+  lv_obj_clear_flag(s_mon_chart, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(s_mon_chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_mon_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_mon_chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_mon_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_mon_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_line_color(s_mon_chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);   // grid lines
+  lv_obj_set_style_size(s_mon_chart, 0, LV_PART_INDICATOR);     // hide point dots
+  lv_obj_set_style_line_width(s_mon_chart, 2, LV_PART_ITEMS);
+  lv_chart_set_type(s_mon_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_mon_chart, 72);
+  lv_chart_set_update_mode(s_mon_chart, LV_CHART_UPDATE_MODE_SHIFT);
+  lv_chart_set_range(s_mon_chart, LV_CHART_AXIS_PRIMARY_Y, MON_RSSI_MIN, MON_RSSI_MAX);
+  lv_chart_set_div_line_count(s_mon_chart, 3, 0);
+  // dBm scale up the left edge: 3 labels (-20 top / -75 mid / -130 floor). The
+  // labels draw in a left gutter, so inset the plot area with pad_left and add a
+  // little top/bottom room so the end labels don't clip.
+  lv_obj_set_style_pad_left(s_mon_chart, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(s_mon_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(s_mon_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(s_mon_chart, 4, LV_PART_TICKS);    // gap between dBm label and tick
+  lv_obj_set_style_text_font(s_mon_chart, &g_font_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_mon_chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+  lv_obj_set_style_line_color(s_mon_chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+  // draw_size (last arg) reserves the off-edge space for the labels so they
+  // aren't clipped; 40 covers a "-130" label + gap + tick within chart_x.
+  lv_chart_set_axis_tick(s_mon_chart, LV_CHART_AXIS_PRIMARY_Y, 4, 0, 3, 1, true, 40);
+  s_mon_nf_ser = lv_chart_add_series(s_mon_chart, lv_color_hex(0x4A5256), LV_CHART_AXIS_PRIMARY_Y);  // noise floor
+  s_mon_ser    = lv_chart_add_series(s_mon_chart, lv_color_hex(0x35C9C9), LV_CHART_AXIS_PRIMARY_Y);  // live RSSI
+  lv_chart_set_all_value(s_mon_chart, s_mon_ser,    MON_RSSI_MIN);
+  lv_chart_set_all_value(s_mon_chart, s_mon_nf_ser, MON_RSSI_MIN);
+
+  // ---- key metrics (recolour for the margin grade) ----
+  const int met_y = chart_y + chart_h + 6;
+  s_mon_metrics_lbl = lv_label_create(s_monitor_root);
+  lv_label_set_recolor(s_mon_metrics_lbl, true);
+  lv_obj_set_width(s_mon_metrics_lbl, sw - 20);   // full content width (label sits at x=10, not the chart gutter)
+  lv_obj_set_pos(s_mon_metrics_lbl, 10, met_y);
+  lv_obj_set_style_text_font(s_mon_metrics_lbl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_mon_metrics_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+
+  // ---- "Recently heard" header ----
+  const int hdr_y = met_y + (narrow ? 52 : 36);   // narrow shows 3 metric lines, landscape 2
+  lv_obj_t* hdr = lv_label_create(s_monitor_root);
+  lv_label_set_text(hdr, "Recently heard");
+  lv_obj_set_style_text_font(hdr, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hdr, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(hdr, 10, hdr_y);
+
+  // ---- scrollable feed ----
+  lv_obj_t* sc = lv_obj_create(s_monitor_root);
+  lv_obj_remove_style_all(sc);
+  const int sc_y = hdr_y + 16;
+  lv_obj_set_pos(sc, 10, sc_y);
+  lv_obj_set_size(sc, sw - 20, H - sc_y - 6);
+  lv_obj_set_style_bg_opa(sc, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(sc, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(sc, LV_SCROLLBAR_MODE_AUTO);
+
+  s_mon_feed_lbl = lv_label_create(sc);
+  lv_label_set_recolor(s_mon_feed_lbl, true);
+  lv_label_set_long_mode(s_mon_feed_lbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(s_mon_feed_lbl, sw - 28);
+  lv_obj_set_pos(s_mon_feed_lbl, 0, 0);
+  lv_obj_set_style_text_font(s_mon_feed_lbl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_mon_feed_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+
+  monitorBuildMetrics();
+  monitorBuildFeed();
+  s_mon_timer = lv_timer_create(monitorTimerCb, 300, nullptr);   // ~3 Hz refresh
+  lv_obj_move_foreground(s_monitor_root);
+}
+
 static void homeChartClickedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   openSignalInfoPopup();
@@ -12831,7 +13159,8 @@ static void ctSheetRepaint(){
 static void ctSortOptCb(lv_event_t* e){
   if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
   g_contacts_sort = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
-  ctSheetRepaint(); s_ct_list_force = true; refreshContactsList();
+  s_ct_list_force = true; refreshContactsList();
+  ctSortSheetClose();   // a sort is a single choice — apply it and dismiss the sheet
 }
 static void ctFilterOptCb(lv_event_t* e){
   if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
@@ -17504,7 +17833,9 @@ static void refreshChatList(LvChatPanel& p) {
     copyUtf8ReplacingMissingGlyphs(&g_font_14, san_name, sizeof(san_name), name);
 
     // Name only — the unread count is shown as a right-aligned badge below.
-    const char* icon = ch ? LV_SYMBOL_LOOP : LV_SYMBOL_ENVELOPE;
+    // DM = single person; channel = group of people (renders via the person_font
+    // splice on g_font_14). Replaces the old envelope / loop-arrow glyphs.
+    const char* icon = ch ? TOUCH_SYM_GROUP : TOUCH_SYM_PERSON;
     lv_obj_t* btn = lv_list_add_btn(p.list_cont, icon, san_name);
 
     // WhatsApp-like row style
@@ -18185,7 +18516,7 @@ static void updateTrackball(unsigned long now) {
 // gestures so they don't leak to the drawer or switch tabs underneath them.
 // Defined OUTSIDE HAS_TDECK_KEYBOARD so the ungated gesture handlers can use it.
 static bool drawerPopupOpen() {
-  return s_siginfo_root || s_mentions_root || s_power_menu || s_ct_sort_sheet || s_ctd_overlay || settingsModalIsOpen()
+  return s_siginfo_root || s_monitor_root || s_mentions_root || s_power_menu || s_ct_sort_sheet || s_ctd_overlay || settingsModalIsOpen()
 #if defined(HAS_TDECK_GT911)
          || s_fullscreen_view
 #endif
@@ -18198,7 +18529,7 @@ static bool anyPopupOpen() {
          s_channel_long_sheet || s_action_sheet_root || s_contacts_search_sheet ||
          s_contacts_overflow_root || s_share_my_root || s_los_root || s_admin_root ||
          s_meminfo_root || settingsModalIsOpen() || s_settings_sheet || s_cc_root ||
-         s_appdrawer_root || s_power_menu || s_siginfo_root || s_mentions_root || s_ct_sort_sheet || s_ctd_overlay
+         s_appdrawer_root || s_power_menu || s_siginfo_root || s_monitor_root || s_mentions_root || s_ct_sort_sheet || s_ctd_overlay
 #if defined(HAS_TDECK_GT911)
          || s_fullscreen_view || s_term_picker_root || s_fm_prompt || s_fm_actions || s_editor_root || s_fm_img_root
 #endif
@@ -18210,6 +18541,7 @@ static bool anyPopupOpen() {
 // X / close button. Returns true if one was dismissed.
 static bool hwKeyDismissTopPopup() {
   if (s_meminfo_root)     { closeMemInfo();            return true; }   // topmost diagnostic popup
+  if (s_monitor_root)     { closeMonitorPage();        return true; }   // RF monitor app page
 #if defined(HAS_TDECK_GT911)
   if (s_fm_img_root)      { fmImageClose();           return true; }   // image viewer (top FM overlay)
   if (s_editor_root)      { fmEditorClose();          return true; }   // file-manager modals first
@@ -20166,7 +20498,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR,
 };
 
 static void closeAppDrawer() {
@@ -20392,6 +20724,7 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_MENTIONS:  openMentionsScreen();  return;
     case APPACT_CMDCENTER: setHomeDrawer(false);  return;   // explicit "back to command centre"
     case APPACT_SIGNAL:    openSignalInfoPopup(); return;   // signal/traffic + auto-discover settings
+    case APPACT_MONITOR:   openMonitorPage();    return;   // RF activity graph + repeater-style radio stats
     case APPACT_ADVERT:    openAdvertModalCb(e);  return;
     case APPACT_POWER:     openPowerMenu();      return;
 #if defined(HAS_TDECK_GT911)
@@ -20515,6 +20848,7 @@ static void openAppDrawer() {
     { "@",                 "Mentions",  APPACT_MENTIONS, mentions,  0xF2A33C },      // mention amber
     { LV_SYMBOL_UPLOAD,    "Advertise", APPACT_ADVERT,   0,         0xE072B0 },      // broadcast magenta
     { nullptr,             "Signal",    APPACT_SIGNAL,   0,         COLOR_ACCENT },  // theme (drawn signal bars)
+    { TOUCH_SYM_ANTENNA,   "Monitor",   APPACT_MONITOR,  0,         0x35C9C9 },      // RF monitor cyan
     { LV_SYMBOL_SETTINGS,  "Settings",  APPACT_SETTINGS, 0,         0x9AA3AD },      // neutral gear grey
 #if defined(HAS_TDECK_GT911)
     { ">_",                "Terminal",  APPACT_TERMINAL, 0,         0x3DD27A },      // console green

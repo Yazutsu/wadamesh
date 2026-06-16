@@ -1361,6 +1361,20 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   _ui_sig_snr_q4 = (int8_t)(snr * 4.0f);
   _ui_sig_rssi   = (int8_t)rssi;
   _ui_sig_ms     = millis();
+  // Recent-RX ring for the Monitor app (see UiRxRec): parse the minimal header
+  // (type / route / hops) and push newest-first. Header byte layout is
+  //   [version:2][payload_type:4][route_type:2]
+  // with 4 transport-code bytes following iff route is a TRANSPORT_* one; the
+  // next byte's low 6 bits are the path length (hop count).
+  if (len > 0) {
+    const uint8_t rt = raw[0] & 0x03;
+    const bool    xp = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT);
+    const int     ps = 1 + (xp ? 4 : 0);
+    const uint8_t hops = (ps < len) ? (uint8_t)(raw[ps] & 0x3F) : 0;
+    uiRxLogPush(_ui_sig_ms, (int8_t)rssi, _ui_sig_snr_q4,
+                (uint8_t)((raw[0] >> 2) & 0x0F), rt, hops,
+                (uint8_t)(len > 255 ? 255 : len));
+  }
 #if defined(DISPLAY_CLASS)
   // Diagnostic: log EVERY received frame so we can prove what reaches the
   // radio. Header byte layout is

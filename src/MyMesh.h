@@ -404,6 +404,41 @@ public:
   int8_t   uiSignalRssi()  const { return _ui_sig_rssi; }
   uint32_t uiSignalMs()    const { return _ui_sig_ms; }
 
+  // ---- Recent-RX ring (RF Monitor app) ----
+  // One record per received frame, captured in logRxRaw(): payload type / route
+  // / hop count / length + signal, so the Monitor page can show a live "what am
+  // I hearing" feed without a core hook. Newest-first via uiRxLogGet (i=0 = most
+  // recent). Board-independent — populated on every board, not just touch.
+  struct UiRxRec {
+    uint32_t ms;        // millis() at RX
+    int8_t   rssi;      // dBm
+    int8_t   snr_q4;    // SNR_dB * 4
+    uint8_t  ptype;     // payload type  (raw[0]>>2)&0x0F
+    uint8_t  route;     // route type    raw[0]&0x03
+    uint8_t  hops;      // path length carried (0 = heard direct from origin)
+    uint8_t  len;       // frame length (clamped to 255)
+  };
+  static const int UI_RXLOG_MAX = 16;
+  UiRxRec  _ui_rxlog[UI_RXLOG_MAX];
+  uint8_t  _ui_rxlog_head = 0;        // next write slot
+  uint8_t  _ui_rxlog_cnt  = 0;        // valid entries (<= UI_RXLOG_MAX)
+  uint8_t  uiRxLogCount() const { return _ui_rxlog_cnt; }
+  bool     uiRxLogGet(uint8_t i, UiRxRec& out) const {
+    if (i >= _ui_rxlog_cnt) return false;
+    uint8_t idx = (uint8_t)((_ui_rxlog_head + UI_RXLOG_MAX - 1 - i) % UI_RXLOG_MAX);
+    out = _ui_rxlog[idx];
+    return true;
+  }
+  // Record a reception into the ring (called from logRxRaw).
+  void uiRxLogPush(uint32_t ms, int8_t rssi, int8_t snr_q4,
+                   uint8_t ptype, uint8_t route, uint8_t hops, uint8_t len) {
+    UiRxRec& r = _ui_rxlog[_ui_rxlog_head];
+    r.ms = ms; r.rssi = rssi; r.snr_q4 = snr_q4;
+    r.ptype = ptype; r.route = route; r.hops = hops; r.len = len;
+    _ui_rxlog_head = (uint8_t)((_ui_rxlog_head + 1) % UI_RXLOG_MAX);
+    if (_ui_rxlog_cnt < UI_RXLOG_MAX) _ui_rxlog_cnt++;
+  }
+
   /** Fingerprint of the most-recently originated flood TXT payload (0 if none). */
   uint32_t uiLastSentFp() const { return _last_sent_fp; }
 
