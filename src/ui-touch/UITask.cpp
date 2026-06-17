@@ -524,6 +524,7 @@ struct GlobalStatusBar {
   lv_obj_t* conn_icon;       // Wi-Fi glyph
   lv_obj_t* ble_icon;        // Bluetooth glyph (separate from Wi-Fi)
   lv_obj_t* sd_icon;         // microSD read/write activity LED (left of Wi-Fi)
+  lv_obj_t* async_icon;      // async mesh-request spinner glyph (centre, transient)
   lv_obj_t* clock;
   lv_obj_t* batt_pct;
   lv_obj_t* batt_icon;
@@ -544,6 +545,13 @@ static void updateGlobalStatusBar();   // fwd decl, called from refresh tick
 // S3, and a stale read only ever mistimes the LED by a frame, which is harmless.
 static volatile uint32_t g_sd_io_ms = 0;
 static inline void markSdIo() { const uint32_t t = millis(); g_sd_io_ms = t ? t : 1; }
+
+// Async mesh-request activity: a small spinner glyph in the status bar while a
+// request is sending or awaiting a reply. markMeshRequest() stamps a send; the
+// indicator also stays lit while a UI reply is pending (s_ui_ping_deadline_ms,
+// telemetry/ping) or the sightline worker is busy (s_los_busy).
+static volatile uint32_t g_mesh_req_ms = 0;
+static inline void markMeshRequest() { const uint32_t t = millis(); g_mesh_req_ms = t ? t : 1; }
 // How long the LED stays lit after the last SD access (ms). Long enough that a
 // single quick read is visible, short enough to read as "activity" not "on".
 static constexpr uint32_t k_sd_io_led_ms = 180;
@@ -8007,6 +8015,7 @@ static void adminPwSubmitCb(lv_event_t* e) {
                               lv_obj_has_state(s_admin_pw_remember, LV_STATE_CHECKED));
   int r = the_mesh.uiSendAdminLogin(*c, s_admin_pw_attempt);
   if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+    markMeshRequest();   // status-bar async spinner
     if (g_lv.task) g_lv.task->showAlert(TR("Logging in\xe2\x80\xa6"), 1500);
   } else {
     if (g_lv.task) g_lv.task->showAlert(TR("Send failed"), 1200);
@@ -8234,6 +8243,7 @@ static void actionSheetTracePingCb(lv_event_t* e) {
   if (tag == 0) {
     g_lv.task->showAlert(TR("Trace failed"), 1200);
   } else {
+    markMeshRequest();   // status-bar async spinner
     g_lv.task->showAlert(TR("Trace sent\xe2\x80\xa6"), 1200);
   }
 }
@@ -8251,6 +8261,7 @@ static void actionSheetRangeTestCb(lv_event_t* e) {
   uint32_t ack_hash = 0;
   int r = the_mesh.sendMessage(c, ts, 0, "RangeTest \xe2\x80\x94 ACK?", ack_hash, est, &hash4);
   if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+    markMeshRequest();   // status-bar async spinner
     g_lv.task->showAlert(r == MSG_SEND_SENT_DIRECT ? TR("RangeTest sent (direct)")
                                                    : TR("RangeTest sent (flood)"), 1400);
   } else {
@@ -21390,6 +21401,16 @@ static void buildGlobalStatusBar() {
   lv_obj_align(g_statusbar.sd_icon, LV_ALIGN_RIGHT_MID, -91, 0);
   lv_obj_add_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);   // shown only during SD I/O
 
+  // Async mesh-request spinner — a refresh glyph centred in the bar, blinking
+  // while a request is in flight (UITask::loop drives it). Centre keeps it clear
+  // of both the left-zone title and the right-side icon cluster.
+  g_statusbar.async_icon = lv_label_create(g_statusbar.root);
+  lv_label_set_text(g_statusbar.async_icon, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_font(g_statusbar.async_icon, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g_statusbar.async_icon, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_align(g_statusbar.async_icon, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);   // shown only while a request is in flight
+
   // ---- Mesh signal-strength bars (just left of the battery) ----
   // Four bars of increasing height; the lit count reflects the SNR of the last
   // packet we heard (updateGlobalStatusBar recolors them). Dim = no recent RX.
@@ -25964,6 +25985,27 @@ void UITask::loop() {
       s_sd_led = lit;
       if (lit) lv_obj_clear_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);
       else     lv_obj_add_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  // Async mesh-request spinner: blink the centre glyph while a request is sending
+  // or awaiting a reply (recent markMeshRequest, a pending UI reply, or the LOS
+  // worker). Cheap — a blink toggle, no animation.
+  if (g_statusbar.async_icon) {
+    const bool active = (g_mesh_req_ms != 0 && (uint32_t)(now - g_mesh_req_ms) < 1500u)
+                        || (s_ui_ping_deadline_ms != 0) || s_los_busy;
+    static bool     s_async_shown = false;
+    static uint32_t s_async_blink = 0;
+    if (active) {
+      if ((uint32_t)(now - s_async_blink) >= 350u) {
+        s_async_blink = (uint32_t)now;
+        s_async_shown = !s_async_shown;
+        if (s_async_shown) lv_obj_clear_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
+        else               lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
+      }
+    } else if (!lv_obj_has_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN)) {
+      s_async_shown = false;
+      lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
     }
   }
 
