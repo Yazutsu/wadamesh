@@ -13972,6 +13972,7 @@ static lv_obj_t* s_map_count_lbl   = nullptr;   // marker / download count (bott
 static lv_obj_t* s_map_status_lbl  = nullptr;
 static lv_obj_t* s_map_zoom_lbl    = nullptr;   // zoom + tile path at center (top-left, under © OSM)
 static lv_obj_t* s_map_zoom_slider = nullptr;   // zoom slider overlay (toggled by the zoom button)
+static lv_obj_t* s_map_zoom_val    = nullptr;   // live "z<level>" readout centred above the slider
 
 #if defined(ESP32)
 // Dedicated LittleFS instance for the map tile pack — mounts the "tiles"
@@ -16614,7 +16615,7 @@ static void mapZoomOutCb(lv_event_t* e) {
 static void mapZoomSliderCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const int z = (int)lv_slider_get_value(lv_event_get_target(e));
-  if (s_map_zoom_lbl) lv_label_set_text_fmt(s_map_zoom_lbl, "z%d", z);   // live feedback while dragging
+  if (s_map_zoom_val) lv_label_set_text_fmt(s_map_zoom_val, "zoom %d", z);   // live target level while dragging
 }
 static void mapZoomSliderReleaseCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
@@ -16637,8 +16638,14 @@ static void mapZoomToggleCb(lv_event_t* e) {
     lv_slider_set_value(s_map_zoom_slider, s_map_zoom, LV_ANIM_OFF);
     lv_obj_clear_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_map_zoom_slider);
+    if (s_map_zoom_val) {
+      lv_label_set_text_fmt(s_map_zoom_val, "zoom %d", (int)s_map_zoom);
+      lv_obj_clear_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(s_map_zoom_val);
+    }
   } else {
     lv_obj_add_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
+    if (s_map_zoom_val) lv_obj_add_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
   }
 }
 static void mapRecenterCb(lv_event_t* e) {
@@ -16897,6 +16904,19 @@ static void makeMapTab(lv_obj_t* tab) {
   lv_obj_add_event_cb(s_map_zoom_slider, mapZoomSliderCb,        LV_EVENT_VALUE_CHANGED, nullptr);
   lv_obj_add_event_cb(s_map_zoom_slider, mapZoomSliderReleaseCb, LV_EVENT_RELEASED,      nullptr);
   lv_obj_add_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
+
+  // Live zoom-level readout, centred above the whole slider; shown with it.
+  s_map_zoom_val = lv_label_create(tab);
+  lv_label_set_text(s_map_zoom_val, "zoom");
+  lv_obj_set_style_text_font(s_map_zoom_val, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_map_zoom_val, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_map_zoom_val, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_map_zoom_val, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(s_map_zoom_val, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(s_map_zoom_val, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_map_zoom_val, 4, LV_PART_MAIN);
+  lv_obj_align_to(s_map_zoom_val, s_map_zoom_slider, LV_ALIGN_OUT_TOP_MID, 0, -6);
+  lv_obj_add_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
 
   // (OSM attribution now lives in the status bar's left zone on the map tab —
   // see updateGlobalStatusBar.)
