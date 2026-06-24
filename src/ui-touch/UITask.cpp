@@ -1815,11 +1815,14 @@ static bool s_nav_ta_editing = false;
 
 static void navFocusCb(lv_group_t* g) {
   lv_obj_t* f = lv_group_get_focused(g);
-  // Edit mode on focus: the chat composer auto-edits (you opened the chat to type, and the
-  // cursor shows immediately); every OTHER field starts in navigate mode so the letter-nav
-  // keys keep working — press select/Enter to edit it. Esc/Enter on an empty composer drops
-  // it back to navigate mode (handled in navPump / handleHwKey).
-  s_nav_ta_editing = (f != nullptr && (f == g_lv.ch.composer_ta || f == g_lv.dm.composer_ta));
+  // Edit mode on focus: the chat composer auto-edits (you opened the chat to type), and a
+  // field focused by a TOUCH tap edits immediately too — a touch user pointed right at it and
+  // shouldn't have to press Enter. Every OTHER field (reached with the letter-nav keys) starts
+  // in navigate mode so those keys keep working — press select/Enter to edit it. Esc/Enter on
+  // an empty composer drops it back to navigate mode (handled in navPump / handleHwKey).
+  lv_indev_t* act = lv_indev_get_act();   // the indev driving this focus change (null if programmatic)
+  const bool by_touch = act && lv_indev_get_type(act) == LV_INDEV_TYPE_POINTER;
+  s_nav_ta_editing = (f != nullptr && (by_touch || f == g_lv.ch.composer_ta || f == g_lv.dm.composer_ta));
   if (s_nav_styled && s_nav_styled != f) navUnstyle(s_nav_styled);
   s_nav_styled = nullptr;                  // old highlight (if any) is now restored; nothing styled yet
   if (!f || !s_nav_show) return;          // focus-visible: paint only while actively keyboard-navigating
@@ -17009,6 +17012,12 @@ static void renderMapTiles() {
     // Wi-Fi worker holds a socket pushed the heap into an OOM reboot. When tiles
     // are arriving from the network, let LVGL batch one redraw at the end.
     if (s_tile_fetch_pending == 0) lv_refr_now(NULL);
+    // Yield to the IDLE task after each tile's read + decode + paint. This loop
+    // runs on loopTask, which is what the task watchdog watches via IDLE1; a full
+    // 9-tile load (or a few slow SD reads) can otherwise pin the core long enough
+    // to starve IDLE1 and panic (the loopTask Task-WDT reboot this fixes — the
+    // download worker already does the same vTaskDelay(1) on its side).
+    vTaskDelay(1);
   }
 
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
