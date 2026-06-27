@@ -271,6 +271,14 @@ void    touchPrefsSetSoundMentions(bool on);
 uint8_t touchPrefsGetSoundVolume();            // 0..100, default 70
 void    touchPrefsSetSoundVolume(uint8_t vol);
 
+/** Per-event notification sound FILE (empty = built-in chime). Slot:
+ *  0 = message, 1 = direct/DM, 2 = @-mention. Stored as a path pref like the
+ *  lock wallpaper ("" | "/sounds/x.wav" | "sd:/x.wav"). T-Deck only. */
+enum { TOUCH_SND_MSG = 0, TOUCH_SND_DM = 1, TOUCH_SND_MEN = 2 };
+constexpr int TOUCH_SOUND_PATH_MAXLEN = 128;
+int  touchPrefsGetSoundFile(int slot, char* out, int out_cap);
+bool touchPrefsSetSoundFile(int slot, const char* path);
+
 /** Tanmatsu keyboard backlight brightness, 0–100 %. Default 100. Separate from
  *  screen brightness (touchPrefsGet/SetBrightness) and volume (…SoundVolume). */
 uint8_t touchPrefsGetKbdBacklight();

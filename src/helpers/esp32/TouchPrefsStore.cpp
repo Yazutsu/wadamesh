@@ -541,6 +541,37 @@ bool touchPrefsSetLockWallpaper(const char* path) {
   return ok;
 }
 
+static const char* soundFileKey(int slot) {
+  switch (slot) {
+    case TOUCH_SND_DM:  return "snd_dm";
+    case TOUCH_SND_MEN: return "snd_men";
+    default:            return "snd_msg";
+  }
+}
+int touchPrefsGetSoundFile(int slot, char* out, int out_cap) {
+  if (!out || out_cap <= 0) return 0;
+  out[0] = '\0';
+  if (!s_begun) touchPrefsBegin();
+  String v = prefsGetStr(soundFileKey(slot), String(""));
+  int n = (int)v.length();
+  if (n > out_cap - 1) n = out_cap - 1;
+  if (n > TOUCH_SOUND_PATH_MAXLEN - 1) n = TOUCH_SOUND_PATH_MAXLEN - 1;
+  memcpy(out, v.c_str(), (size_t)n);
+  out[n] = '\0';
+  return n;
+}
+bool touchPrefsSetSoundFile(int slot, const char* path) {
+  if (!s_begun) touchPrefsBegin();
+  s_prefs.end();
+  if (!s_prefs.begin(TOUCH_NS, false)) return false;
+  bool ok;
+  if (!path || !path[0]) { s_prefs.remove(soundFileKey(slot)); ok = true; }   // empty => built-in chime
+  else                     ok = s_prefs.putString(soundFileKey(slot), path) > 0;
+  s_prefs.end();
+  s_begun = s_prefs.begin(TOUCH_NS, true);
+  return ok;
+}
+
 int touchPrefsGetTimeOffsetHours() {
   if (!s_begun) touchPrefsBegin();
   int v = (int)s_cfg.time_offs;
